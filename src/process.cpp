@@ -244,8 +244,6 @@ namespace proc {
 
   void
   proc_t::terminate() {
-    std::error_code ec;
-
     // Ensure child process is terminated
     placebo = false;
     process_end(_process, _process_handle);
@@ -264,6 +262,7 @@ namespace proc {
                                               find_working_directory(cmd.undo_cmd, _env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Executing Undo Cmd: ["sv << cmd.undo_cmd << ']';
+      std::error_code ec;
       auto child = platf::run_command(cmd.elevated, true, cmd.undo_cmd, working_dir, _env, _pipe.get(), ec, nullptr);
 
       if (ec) {

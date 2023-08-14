@@ -272,15 +272,24 @@ namespace platf {
     return userToken;
   }
 
-  bool
-  merge_user_environment_block(bp::environment &env, HANDLE shell_token) {
+  bp::environment
+  merge_user_environment_block(bp::environment &env, HANDLE shell_token, std::error_code &ec) {
     // Get the target user's environment block
     PVOID env_block;
     if (!CreateEnvironmentBlock(&env_block, shell_token, FALSE)) {
-      return false;
+      // If we couldn't get the environment block, set an error code and return an empty environment
+      BOOST_LOG(error) << "Failed to create a user environment block: "sv << GetLastError();
+      ec = std::make_error_code(std::errc::state_not_recoverable);
+      return bp::environment();
     }
 
-    // Parse the environment block and populate env
+    // Guard to ensure that DestroyEnvironmentBlock is called when the function exits
+    auto env_block_destroy = util::fail_guard([&env_block]() {
+      DestroyEnvironmentBlock(env_block);
+    });
+
+    // Parse the environment block and populate new_env
+    bp::environment new_env(env);
     for (auto c = (PWCHAR) env_block; *c != UNICODE_NULL; c += wcslen(c) + 1) {
       // Environment variable entries end with a null-terminator, so std::wstring() will get an entire entry.
       std::string env_tuple = converter.to_bytes(std::wstring { c });
@@ -297,16 +306,15 @@ namespace platf {
 
       // For the PATH variable, we will merge the values together
       if (boost::iequals(env_name, "PATH")) {
-        env[env_name] = env_val + ";" + env[env_name].to_string();
+        new_env[env_name] = env_val + ";" + env[env_name].to_string();
       }
       else {
         // Other variables will be superseded by those in the user's environment block
-        env[env_name] = env_val;
+        new_env[env_name] = env_val;
       }
     }
 
-    DestroyEnvironmentBlock(env_block);
-    return true;
+    return new_env;
   }
 
   /**
@@ -575,30 +583,44 @@ namespace platf {
     // Create a new console for interactive processes and use no console for non-interactive processes
     creation_flags |= interactive ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
 
+    // Get a token. The token used depends on whether we're running as system or not
+    HANDLE token;
     if (is_running_as_system()) {
       // Duplicate the current user's token
-      HANDLE user_token = retrieve_users_token(elevated);
-      if (!user_token) {
-        // Fail the launch rather than risking launching with Sunshine's permissions unmodified.
-        ec = std::make_error_code(std::errc::permission_denied);
-        return bp::child();
+      token = retrieve_users_token(elevated);
+    }
+    else {
+      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &token)) {
+        BOOST_LOG(error) << "Unable to open process token: "sv << GetLastError();
+        token = nullptr;
       }
+    }
 
-      // Use RAII to ensure the shell token is closed when we're done with it
-      auto token_close = util::fail_guard([user_token]() {
-        CloseHandle(user_token);
-      });
+    if (!token) {
+      ec = std::make_error_code(std::errc::permission_denied);
+      return bp::child();
+    }
 
-      // Populate env with user-specific environment variables
-      if (!merge_user_environment_block(env, user_token)) {
-        ec = std::make_error_code(std::errc::not_enough_memory);
-        return bp::child();
-      }
+    // Use RAII to ensure the shell token is closed when we're done with it
+    auto token_close = util::fail_guard([token]() {
+      CloseHandle(token);
+    });
 
+    // Merge the given environment with the user's environment block, to create a new environment
+    bp::environment new_env = merge_user_environment_block(env, token, ec);
+
+    if (ec) {
+      // If we failed to create the new environment, we should just fail with a blank child process.
+      return bp::child();
+    }
+
+    // Convert the environment to an environment block
+    std::wstring env_block = create_environment_block(new_env);
+
+    if (is_running_as_system()) {
       // Open the process as the current user account, elevation is handled in the token itself.
-      ec = impersonate_current_user(user_token, [&]() {
-        std::wstring env_block = create_environment_block(env);
-        ret = CreateProcessAsUserW(user_token,
+      ec = impersonate_current_user(token, [&]() {
+        ret = CreateProcessAsUserW(token,
           NULL,
           (LPWSTR) wcmd.c_str(),
           NULL,
@@ -614,23 +636,6 @@ namespace platf {
     // Otherwise, launch the process using CreateProcessW()
     // This will inherit the elevation of whatever the user launched Sunshine with.
     else {
-      // Open our current token to resolve environment variables
-      HANDLE process_token;
-      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &process_token)) {
-        ec = std::make_error_code(std::errc::permission_denied);
-        return bp::child();
-      }
-      auto token_close = util::fail_guard([process_token]() {
-        CloseHandle(process_token);
-      });
-
-      // Populate env with user-specific environment variables
-      if (!merge_user_environment_block(env, process_token)) {
-        ec = std::make_error_code(std::errc::not_enough_memory);
-        return bp::child();
-      }
-
-      std::wstring env_block = create_environment_block(env);
       ret = CreateProcessW(NULL,
         (LPWSTR) wcmd.c_str(),
         NULL,
